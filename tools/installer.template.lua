@@ -98,83 +98,6 @@ function Installer.decodeChunk(env, chunk, blob, files)
     return rows
 end
 
--- Keep existing signed parts; only their download order changes.
-function Installer.prioritizeChunks(chunks)
-    local buckets = {{}, {}, {}, {}, {}, {}}
-    for _, chunk in ipairs(chunks) do
-        local priority = 6
-        for _, path in ipairs(chunk.files) do
-            if path == "HussValley/ui/giorgio/manifest.json" then priority = 1 break end
-            for index, name in ipairs({"one", "two", "three", "four"}) do
-                if path:find("HussValley/ui/giorgio/media/edit-" .. name .. "/", 1, true) == 1 then
-                    priority = math.min(priority, index + 1)
-                end
-            end
-        end
-        table.insert(buckets[priority], chunk)
-    end
-    local ordered = {}
-    for _, bucket in ipairs(buckets) do
-        for _, chunk in ipairs(bucket) do table.insert(ordered, chunk) end
-    end
-    return ordered
-end
-
--- The film clock consumes only verified, decoded frames; stalls never skip content.
-function Installer.newFilmStream(files)
-    local stream = {files = files, verified = {}, films = {}, selected = 1, position = 0, buffering = true}
-    for _, name in ipairs({"one", "two", "three", "four"}) do
-        local prefix = "HussValley/ui/giorgio/media/edit-" .. name .. "/"
-        local count = 0
-        while files[prefix .. string.format("frame-%05d.jpg", count)] do count += 1 end
-        if count > 0 then table.insert(stream.films, {prefix = prefix, count = count, fps = 60, audio = prefix .. "audio.ogg"}) end
-    end
-    function stream:mark(path)
-        if self.files[path] then self.verified[path] = true end
-    end
-    function stream:frame(film, index)
-        return film.prefix .. string.format("frame-%05d.jpg", index)
-    end
-    function stream:step(dt, ready)
-        local film = self.films[self.selected]
-        if not film then return nil end
-        local currentIndex = math.min(film.count - 1, math.floor(self.position * film.fps))
-        local current = self:frame(film, currentIndex)
-        if not self.verified[current] or not ready(current) then
-            self.buffering = true
-            return nil
-        end
-        local nextPosition = self.position + math.clamp(dt, 0, 0.1)
-        local nextIndex = math.floor(nextPosition * film.fps)
-        for index = currentIndex + 1, math.min(nextIndex, film.count - 1) do
-            local path = self:frame(film, index)
-            if not self.verified[path] or not ready(path) then
-                self.buffering = true
-                return current
-            end
-        end
-        if nextIndex >= film.count then
-            local selected = self.selected % #self.films + 1
-            local nextFilm = self.films[selected]
-            local first = self:frame(nextFilm, 0)
-            if self.verified[first] and ready(first) then
-                self.selected, self.position, self.buffering = selected, 0, false
-                return first
-            end
-            local firstCurrent = self:frame(film, 0)
-            if self.verified[firstCurrent] and ready(firstCurrent) then
-                self.position, self.buffering = 0, false
-                return firstCurrent
-            end
-            self.buffering = true
-            return current
-        end
-        self.position, self.buffering = nextPosition, false
-        return self:frame(film, nextIndex)
-    end
-    return stream
-end
-
 function Installer.install(env, url, manifestHash)
     assert(type(url) == "string" and url:match("^https://[^%s]+/manifest%.json$") and validHash(manifestHash), "Huss Valley release is not configured; connect the release URL and SHA-256 first")
     env.progress("manifest", 0, 0, 0, 0)
@@ -182,10 +105,6 @@ function Installer.install(env, url, manifestHash)
     assert(type(manifestBody) == "string" and #manifestBody <= 32 * 1024 * 1024 and (env.rawHash or env.hash)(manifestBody) == manifestHash, "Giorgio manifest failed SHA-256 verification")
     local manifest = env.decode(manifestBody)
     local files = Installer.validateManifest(manifest)
-    if env.onManifest then pcall(env.onManifest, files) end
-    local function verified(path)
-        if env.onVerified then pcall(env.onVerified, path) end
-    end
     local valid, complete, transferred, installed = {}, 0, 0, 0
     env.progress("checking", complete, manifest.total_bytes, transferred, installed)
     for index, file in ipairs(manifest.files) do
@@ -195,7 +114,6 @@ function Installer.install(env, url, manifestHash)
                 valid[file.path] = true
                 complete += file.bytes
                 installed += 1
-                verified(file.path)
             end
         end
         if index % 32 == 0 then
@@ -215,7 +133,7 @@ function Installer.install(env, url, manifestHash)
             end
         end
     end
-    for index, chunk in ipairs(Installer.prioritizeChunks(manifest.chunks)) do
+    for index, chunk in ipairs(manifest.chunks) do
         local needed = false
         for _, path in ipairs(chunk.files) do if not valid[path] then needed = true break end end
         if needed then
@@ -232,7 +150,6 @@ function Installer.install(env, url, manifestHash)
                     valid[row.path] = true
                     complete += files[row.path].bytes
                     installed += 1
-                    verified(row.path)
                 end
                 if rowIndex % 16 == 0 then
                     env.progress("installing", complete, manifest.total_bytes, transferred, installed, index, #manifest.chunks)
@@ -502,179 +419,6 @@ end)
 title.TextSize = math.clamp(math.floor(content.AbsoluteSize.X / 14), 18, 43)
 local alive, progressTween, compactTween, executing = true, nil, nil, false
 local closeButton, closeConnection, minimizeConnection, expandConnection, progressView
-local filmStream, mediaConnection
-local mediaWorkers, decodedFrames, audioIds = {}, {}, {}
-local mediaEpoch, registeredEpoch = 0, -1
-local mediaStopped, mediaMuted = false, true
-local contentProvider = game:GetService("ContentProvider")
-local filmSurface = Instance.new("ImageLabel")
-filmSurface.Name = "DownloadingEdits"
-filmSurface.BackgroundTransparency = 1
-filmSurface.AnchorPoint = Vector2.new(0.5, 0)
-filmSurface.Position = UDim2.fromScale(0.5, 0.035)
-filmSurface.Size = UDim2.fromScale(0.94, 0.66)
-filmSurface.ScaleType = Enum.ScaleType.Fit
-filmSurface.Parent = background
-local filmCaption = Instance.new("TextLabel")
-filmCaption.Name = "FilmStatus"
-filmCaption.BackgroundTransparency = 1
-filmCaption.Position = UDim2.fromScale(0.05, 0.70)
-filmCaption.Size = UDim2.fromScale(0.9, 0.04)
-filmCaption.Font = Enum.Font.GothamMedium
-filmCaption.TextSize = 11
-filmCaption.TextColor3 = muted
-filmCaption.Text = "BUFFERING YOUR FIRST EDIT"
-filmCaption.Parent = background
-local muteFilm = Instance.new("TextButton")
-muteFilm.Name = "MuteEdits"
-muteFilm.Position = UDim2.fromOffset(24, 24)
-muteFilm.Size = UDim2.fromOffset(110, 32)
-muteFilm.BackgroundTransparency = 1
-muteFilm.Font = Enum.Font.GothamMedium
-muteFilm.TextSize = 11
-muteFilm.TextColor3 = ivory
-muteFilm.Text = "UNMUTE EDITS"
-muteFilm.Parent = background
-local filmSound = Instance.new("Sound")
-filmSound.Name = "InstallEditAudio"
-filmSound.Volume = 0.3
-filmSound.Parent = gui
-local muteConnection = muteFilm.Activated:Connect(function()
-    mediaMuted = not mediaMuted
-    muteFilm.Text = mediaMuted and "UNMUTE EDITS" or "MUTE EDITS"
-end)
-content.AnchorPoint = Vector2.new(0.5, 1)
-content.Position = UDim2.fromScale(0.5, 0.97)
-content.Size = UDim2.new(0.82, 0, 0.23, 0)
-title.Visible = false
-subtitle.Position = UDim2.fromScale(0, 0.13)
-subtitle.Size = UDim2.fromScale(1, 0.18)
-status.Position = UDim2.fromScale(0, 0.41)
-status.Size = UDim2.fromScale(1, 0.23)
-track.Position = UDim2.fromScale(0, 0.36)
-detail.Position = UDim2.fromScale(0, 0.66)
-detail.Size = UDim2.fromScale(1, 0.30)
-
--- Match the runtime's unique-basename workaround without trusting stale cache bytes.
-local function mediaAsset(path)
-    local meta = filmStream and filmStream.files[path]
-    if not meta or not filmStream.verified[path] then return nil end
-    local bytes = environment.readfile(path)
-    assert(#bytes == meta.bytes and hashFunction(bytes) == Installer.expected({digestField = digestField}, meta), "Edit asset changed after verification")
-    local directory = "HussValley/ui/cache"
-    if not environment.isfolder(directory) then environment.makefolder(directory) end
-    local destination = directory .. "/install_" .. meta.sha256 .. "_" .. path:match("[^/]+$")
-    local valid = false
-    if environment.isfile(destination) then
-        local cached = environment.readfile(destination)
-        valid = #cached == meta.bytes and hashFunction(cached) == Installer.expected({digestField = digestField}, meta)
-    end
-    if not valid then
-        environment.writefile(destination, bytes)
-        local written = environment.readfile(destination)
-        assert(#written == meta.bytes and hashFunction(written) == Installer.expected({digestField = digestField}, meta), "Edit cache write failed")
-    end
-    return environment.getcustomasset(destination)
-end
-local function stopMedia()
-    if mediaStopped then return end
-    mediaStopped = true
-    if mediaConnection then mediaConnection:Disconnect() end
-    muteConnection:Disconnect()
-    for _, worker in ipairs(mediaWorkers) do pcall(task.cancel, worker) end
-    filmSound:Stop()
-    filmSound:Destroy()
-    table.clear(decodedFrames)
-    table.clear(audioIds)
-end
-local function preloadMedia()
-    while alive and not mediaStopped do
-        local film = filmStream and filmStream.films[filmStream.selected]
-        if not film or (progressView and progressView.state.minimized) then task.wait(0.1) continue end
-        local paths = {}
-        local function queue(path)
-            if filmStream.verified[path] and not decodedFrames[path] then
-                decodedFrames[path] = {loading = true}
-                paths[#paths + 1] = path
-            end
-        end
-        queue(filmStream:frame(film, 0))
-        local index = math.min(film.count - 1, math.floor(filmStream.position * film.fps))
-        for offset = 0, 48 do
-            if #paths >= 4 then break end
-            if index + offset < film.count then queue(filmStream:frame(film, index + offset)) end
-        end
-        local nextFilm = filmStream.films[filmStream.selected % #filmStream.films + 1]
-        if #paths < 4 then queue(filmStream:frame(nextFilm, 0)) end
-        local ids = {}
-        for _, path in ipairs(paths) do
-            while alive and not mediaStopped and registeredEpoch == mediaEpoch do task.wait() end
-            if not alive or mediaStopped then return end
-            registeredEpoch = mediaEpoch
-            local ok, id = pcall(mediaAsset, path)
-            if ok and type(id) == "string" then
-                decodedFrames[path] = {id = id, loading = true}
-                ids[#ids + 1] = id
-            else decodedFrames[path] = nil end
-        end
-        if #ids > 0 then
-            local loaded = {}
-            local ok = pcall(function()
-                contentProvider:PreloadAsync(ids, function(id, state) loaded[id] = state == Enum.AssetFetchStatus.Success end)
-            end)
-            if not alive or mediaStopped then return end
-            for _, path in ipairs(paths) do
-                local entry = decodedFrames[path]
-                if entry and entry.id then
-                    if ok and loaded[entry.id] then entry.ready, entry.loading = true, false
-                    else decodedFrames[path] = nil end
-                end
-            end
-        else task.wait(0.05) end
-        if filmStream.verified[film.audio] and not audioIds[film.audio] then
-            local ok, id = pcall(mediaAsset, film.audio)
-            if ok and type(id) == "string" then audioIds[film.audio] = id end
-        end
-    end
-end
-local lastAudio, pruneClock = nil, 0
-mediaConnection = RunService.RenderStepped:Connect(function(dt)
-    mediaEpoch += 1
-    if not alive or mediaStopped then return end
-    if not filmStream or progressView.state.minimized or progressView.state.phase == "failed" then
-        filmSound.Playing = false
-        return
-    end
-    local path = filmStream:step(dt, function(value) return decodedFrames[value] and decodedFrames[value].ready end)
-    local film = filmStream.films[filmStream.selected]
-    if path and decodedFrames[path] then filmSurface.Image = decodedFrames[path].id end
-    filmCaption.Text = not film and "EDITS UNAVAILABLE · DOWNLOAD CONTINUES" or (filmStream.buffering and "BUFFERING · DOWNLOAD CONTINUES" or ("GIORGIO ARMANI / " .. filmStream.selected .. " · INSTALLING IN BACKGROUND"))
-    if not film then return end
-    local audioId = audioIds[film.audio]
-    if audioId and lastAudio ~= audioId then
-        filmSound:Stop()
-        filmSound.SoundId = audioId
-        lastAudio = audioId
-    end
-    local playing = audioId ~= nil and filmSound.IsLoaded and not mediaMuted and not filmStream.buffering
-    if playing and (not filmSound.Playing or math.abs(filmSound.TimePosition - filmStream.position) > 0.2) then filmSound.TimePosition = filmStream.position end
-    filmSound.Playing = playing
-    pruneClock += dt
-    if pruneClock >= 1 then
-        pruneClock = 0
-        local index = math.floor(filmStream.position * film.fps)
-        for path, entry in pairs(decodedFrames) do
-            local frameIndex = tonumber(path:match("frame%-(%d+)%.jpg$"))
-            if not entry.loading and frameIndex ~= 0 and (path:sub(1, #film.prefix) ~= film.prefix or frameIndex < index - 12 or frameIndex > index + 48) then decodedFrames[path] = nil end
-        end
-    end
-end)
-if type(environment.getcustomasset) == "function" then
-    for _ = 1, 3 do mediaWorkers[#mediaWorkers + 1] = task.spawn(preloadMedia) end
-else
-    filmCaption.Text = "EDIT PLAYBACK UNAVAILABLE · DOWNLOAD CONTINUES"
-    muteFilm.Visible = false
-end
 local spin = 0
 local busy, baseStatus = false, ""
 local animation = RunService.RenderStepped:Connect(function(dt)
@@ -685,7 +429,6 @@ end)
 local function cleanup()
     if not alive then return end
     alive = false
-    stopMedia()
     animation:Disconnect()
     headingLayout:Disconnect()
     if closeConnection then closeConnection:Disconnect() end
@@ -748,8 +491,6 @@ local ok, result = pcall(Installer.install, {
     digestField = digestField,
     decode = function(value) return HttpService:JSONDecode(value) end,
     fetch = fetch,
-    onManifest = function(files) filmStream = Installer.newFilmStream(files) end,
-    onVerified = function(path) if filmStream then filmStream:mark(path) end end,
     isfile = environment.isfile,
     readfile = environment.readfile,
     writefile = environment.writefile,
@@ -769,14 +510,13 @@ local ok, result = pcall(Installer.install, {
 environment.HUSSVALLEY_INSTALL_RUNNING = nil
 if not ok then
     busy = false
-    stopMedia()
     if alive then
         progressView:fail(tostring(result):gsub("^.-:%d+: ", ""))
         animation:Disconnect()
         closeButton = Instance.new("TextButton")
         closeButton.Name = "CloseInstaller"
-        closeButton.AnchorPoint = Vector2.new(0.5, 1)
-        closeButton.Position = UDim2.fromScale(0.5, 1)
+        closeButton.AnchorPoint = Vector2.new(0.5, 0)
+        closeButton.Position = UDim2.new(0.5, 0, 0, 284)
         closeButton.Size = UDim2.fromOffset(116, 34)
         closeButton.BackgroundTransparency = 1
         closeButton.Font = Enum.Font.GothamMedium
@@ -784,7 +524,6 @@ if not ok then
         closeButton.TextColor3 = ivory
         closeButton.Text = "CLOSE"
         closeButton.Parent = content
-        detail.Visible = false
         closeConnection = closeButton.Activated:Connect(cleanup)
     end
     error("Huss Valley installation: " .. tostring(result), 0)

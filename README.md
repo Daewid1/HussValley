@@ -14,8 +14,6 @@ run()
 
 The first run installs about **1.21 GB** of runtime and media files. Keep Roblox open while the installer runs; minimize its progress window if needed. Downloads use the executor `request` function. Failed or interrupted installs resume on rerun. SHA-256 checks cover the manifest, each download part, and each installed file, including the runtime before execution. Valid cached files are reused.
 
-The installer now prioritizes the edit media. Playback begins as soon as verified frames have decoded, while the rest of the collection continues downloading. It holds the last frame when buffering, loops available edits, and advances as the next edit arrives. Audio starts muted; choose **UNMUTE EDITS** to enable it. Minimizing pauses playback, not downloads. Completion or failure stops the film and audio. Executors without custom-asset playback still install normally. The signed media release and its existing download cache remain unchanged.
-
 Files install only to `HussValley.lua` and `HussValley/ui/giorgio/`. Existing `HussValley/configs` preferences are untouched. No GitHub token is needed by the public loader. Keep tokens and passwords out of scripts.
 
 Click **Giorgio Armani?** in the header to open the original film viewer: play/pause, stop, next film, seek, volume, drag, and resize. The compact keybind HUD and Huss Valley features remain available.
