@@ -52,7 +52,7 @@ class DistributionTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_core(self, scenario="fresh", transform=None, initial=None):
+    def run_core(self, scenario="fresh", transform=None, initial=None, observer_failure=False):
         manifest = copy.deepcopy(self.manifest)
         bodies = {chunk["file"]: (self.output / chunk["file"]).read_bytes() for chunk in manifest["chunks"]}
         if transform:
@@ -98,10 +98,20 @@ class DistributionTests(unittest.TestCase):
 local downloads, decoded, hashes = {lua(downloads)}, {lua(decode)}, {lua(hashes)}
 local manifest, storage, expected = {lua(manifest)}, {lua(initial)}, {lua(expected_files)}
 local writes, executions, downloadCount = 0, 0, 0
+local notified = {{}}
 local failFetch = {lua(scenario == 'interrupted')}
 local progressView = Installer.newProgressView(function() end)
 local lastComplete, lastTotal, phases = 0, 0, {{}}
 local env = {{
+    onManifest = function(files)
+        assert(files["HussValley.lua"])
+        if {lua(observer_failure)} then error("optional cinema failed") end
+    end,
+    onVerified = function(path)
+        assert(storage[path] == expected[path], "Unverified file reached the film player")
+        notified[path] = true
+        if {lua(observer_failure)} then error("optional cinema failed") end
+    end,
     hash = function(data) return hashes[data] or string.rep('0', 64) end,
     decode = function(data) assert(decoded[data], 'unknown fixture JSON'); return decoded[data] end,
     fetch = function(address)
@@ -126,6 +136,7 @@ local env = {{
     end,
     execute = function(source)
         executions += 1; assert(source == expected['HussValley.lua'])
+        for path in pairs(expected) do assert(notified[path], "Missing verified asset notification") end
         assert(progressView.alive and progressView.state.phase == 'ready' and progressView.state.remaining == 0)
     end,
 }}
@@ -145,6 +156,64 @@ print('PASS {scenario}')
 
     def expected(self):
         return {"HussValley.lua": self.runtime.read_bytes(), **{"HussValley/ui/giorgio/" + p.relative_to(self.assets).as_posix(): p.read_bytes() for p in self.assets.rglob("*") if p.is_file()}}
+
+    def test_cinema_errors_do_not_cancel_verified_install(self):
+        self.run_core(observer_failure=True)
+
+    def test_edit_parts_download_first_without_changing_signed_content(self):
+        self.run_luau(CORE + "\n" + """
+local other = {file = 'other', files = {'HussValley.lua'}}
+local one = {file = 'one', files = {'HussValley/ui/giorgio/media/edit-one/audio.ogg'}}
+local oneMore = {file = 'one-more', files = {'HussValley/ui/giorgio/media/edit-one/frame-00000.jpg'}}
+local two = {file = 'two', files = {'HussValley/ui/giorgio/media/edit-two/frame-00000.jpg'}}
+local manifest = {file = 'manifest', files = {'HussValley/ui/giorgio/manifest.json'}}
+local source = {other, two, one, manifest, oneMore}
+local sorted = Installer.prioritizeChunks(source)
+assert(sorted[1] == manifest and sorted[2] == one and sorted[3] == oneMore and sorted[4] == two and sorted[5] == other)
+assert(source[1] == other and source[5] == oneMore)
+""")
+
+    def test_film_clock_waits_for_verified_and_decoded_frames(self):
+        self.run_luau(CORE + "\n" + """
+local prefix = 'HussValley/ui/giorgio/media/edit-one/'
+local first, second, third = prefix .. 'frame-00000.jpg', prefix .. 'frame-00001.jpg', prefix .. 'frame-00002.jpg'
+local stream = Installer.newFilmStream({[first] = {}, [second] = {}, [third] = {}})
+local loaded = {[first] = true, [second] = true, [third] = true}
+local function ready(path) return loaded[path] end
+assert(stream:step(1/60, ready) == nil and stream.position == 0)
+stream:mark(first)
+stream:mark('untrusted.jpg')
+assert(not stream.verified['untrusted.jpg'])
+assert(stream:step(1/60, ready) == first and stream.position == 0 and stream.buffering)
+stream:mark(second)
+loaded[second] = false
+assert(stream:step(1/60, ready) == first and stream.position == 0)
+loaded[second] = true
+assert(stream:step(1/60, ready) == second and not stream.buffering)
+local position = stream.position
+assert(stream:step(0.1, ready) == second and stream.position == position and stream.buffering)
+stream:mark(third)
+assert(stream:step(0.1, ready) == first and stream.position == 0)
+stream.position = position
+loaded[third] = false
+loaded[first] = false
+assert(stream:step(1/60, ready) == second and stream.position == position and stream.buffering)
+""")
+
+    def test_film_loops_then_advances_when_next_edit_is_ready(self):
+        self.run_luau(CORE + "\n" + """
+local first = 'HussValley/ui/giorgio/media/edit-one/frame-00000.jpg'
+local nextFilm = 'HussValley/ui/giorgio/media/edit-two/frame-00000.jpg'
+local stream = Installer.newFilmStream({[first] = {}, [nextFilm] = {}})
+stream:mark(first)
+local function ready() return true end
+assert(stream:step(1/60, ready) == first and stream.selected == 1 and stream.position == 0)
+stream:mark(nextFilm)
+assert(stream:step(1/60, ready) == nextFilm and stream.selected == 2)
+assert(stream:step(1/60, ready) == first and stream.selected == 1)
+local empty = Installer.newFilmStream({})
+assert(empty:step(1/60, ready) == nil)
+""")
 
     def test_fresh_binary_install(self):
         self.assertTrue(all(c["bytes"] <= 640 for c in self.manifest["chunks"]))
